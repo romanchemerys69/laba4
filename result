@@ -1,0 +1,33 @@
+Generating operation files...
+Generation complete.
+-------------------------------------------
+Loading operation files into memory...
+Load complete. Starting benchmarks...
+-------------------------------------------
+--- Testing: File A (Variant 14) ---
+Total operations: 3600569
+Threads: 1, Avg. Time: 8397.000 ms
+Threads: 2, Avg. Time: 8606.694 ms (Speedup: 0.976x)
+Threads: 3, Avg. Time: 9561.631 ms (Speedup: 0.878x)
+-------------------------------------------
+
+--- Testing: File B (Equal) ---
+Total operations: 2399431
+Threads: 1, Avg. Time: 196.697 ms
+Threads: 2, Avg. Time: 223.073 ms (Speedup: 0.882x)
+Threads: 3, Avg. Time: 275.459 ms (Speedup: 0.714x)
+-------------------------------------------
+
+--- Testing: File C (Write-Heavy) ---
+Total operations: 3000000
+Threads: 1, Avg. Time: 1671.990 ms
+Threads: 2, Avg. Time: 1784.038 ms (Speedup: 0.937x)
+Threads: 3, Avg. Time: 2005.491 ms (Speedup: 0.834x)
+-------------------------------------------
+
+--- Final Results Table (for Report) ---
+|                   | 1 Thread (ms)| 2 Threads (ms)| 3 Threads (ms)|
+|--------------------|---------------|---------------|---------------|
+| File A (Variant 14) |      8397.000 |      8606.694 |      9561.631 |
+| File B (Equal)     |       196.697 |       223.073 |       275.459 |
+| File C (Write-Heavy) |      1671.990 |      1784.038 |      2005.491 |
