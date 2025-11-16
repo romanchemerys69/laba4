@@ -1,0 +1,288 @@
+// Compiler: GCC 13.2.1 (або аналогічний), C++17
+// Потрібен C++17 для <shared_mutex>
+// Compile with: g++ -std=c++17 -O3 -pthread main.cpp -o lab_program
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <fstream>
+#include <thread>
+#include <mutex>
+#include <shared_mutex> // Для std::shared_mutex
+#include <future>         // Для std::async, std::future
+#include <chrono>
+#include <iomanip>      // Для setw, setprecision
+#include <random>       // Для генерації файлів
+#include <functional>     // Для std::function
+
+using namespace std;
+using namespace chrono;
+
+// --- 1. Структура операції ---
+struct Operation {
+    string type;
+    int field;
+    int value; // Використовується тільки для 'write'
+};
+
+// --- 2. Структура даних (Варіант 14) ---
+class DataStructure {
+public:
+    DataStructure(int m) : fields(m) {}
+
+    /**
+     * @brief Встановлює значення поля (операція ЗАПИСУ)
+     */
+    void write(int index, int value) {
+        // Ексклюзивне блокування для запису
+        unique_lock<shared_mutex> lock(rw_mutex);
+        if (index >= 0 && index < fields.size()) {
+            fields[index] = value;
+        }
+    }
+
+    /**
+     * @brief Читає значення поля (операція ЧИТАННЯ)
+     */
+    int read(int index) {
+        // Спільне (shared) блокування для читання
+        shared_lock<shared_mutex> lock(rw_mutex);
+        if (index >= 0 && index < fields.size()) {
+            return fields[index];
+        }
+        return -1;
+    }
+
+    /**
+     * @brief Повертає рядкове представлення (операція ЧИТАННЯ)
+     */
+    operator string() const {
+        // Також спільне блокування, це операція читання
+        shared_lock<shared_mutex> lock(rw_mutex);
+        stringstream ss;
+        ss << "Fields: [";
+        for (size_t i = 0; i < fields.size(); ++i) {
+            ss << fields[i] << (i == fields.size() - 1 ? "" : ", ");
+        }
+        ss << "]";
+        return ss.str();
+    }
+
+private:
+    vector<int> fields;
+    // Один read-write м'ютекс для захисту всіх полів.
+    mutable shared_mutex rw_mutex;
+};
+
+
+// --- 3. Генерація файлів з даними ---
+void generate_data_files(int m, long num_ops) {
+    cout << "Generating operation files..." << endl;
+    mt19937_64 gen(random_device{}());
+
+    // --- Файл A: Варіант 14 (read0: 25, write0: 5, read1: 5, write1: 25, string: 40) ---
+    ofstream file_a("ops_a.txt");
+    {
+        discrete_distribution<> dist({ 25.0, 5.0, 5.0, 25.0, 40.0 });
+        for (long i = 0; i < num_ops; ++i) {
+            int op_id = dist(gen);
+            if (op_id == 0) file_a << "read 0\n";
+            else if (op_id == 1) file_a << "write 0 1\n";
+            else if (op_id == 2) file_a << "read 1\n";
+            else if (op_id == 3) file_a << "write 1 1\n";
+            else if (op_id == 4) file_a << "string\n";
+        }
+    } // file_a закривається
+
+    // --- Файл B: Рівномірний (всі 5 операцій по 20%) ---
+    ofstream file_b("ops_b.txt");
+    {
+        discrete_distribution<> dist({ 20.0, 20.0, 20.0, 20.0, 20.0 });
+        for (long i = 0; i < num_ops; ++i) {
+            int op_id = dist(gen);
+            if (op_id == 0) file_b << "read 0\n";
+            else if (op_id == 1) file_b << "write 0 1\n";
+            else if (op_id == 2) file_b << "read 1\n";
+            else if (op_id == 3) file_b << "write 1 1\n";
+            else if (op_id == 4) file_a << "string\n";
+        }
+    } // file_b закривається
+
+    // --- Файл C: Негативний сценарій (80% write) ---
+    ofstream file_c("ops_c.txt");
+    {
+        discrete_distribution<> dist({ 5.0, 40.0, 5.0, 40.0, 10.0 });
+        for (long i = 0; i < num_ops; ++i) {
+            int op_id = dist(gen);
+            if (op_id == 0) file_c << "read 0\n";
+            else if (op_id == 1) file_c << "write 0 1\n";
+            else if (op_id == 2) file_c << "read 1\n";
+            else if (op_id == 3) file_c << "write 1 1\n";
+            else if (op_id == 4) file_c << "string\n";
+        }
+    } // file_c закривається
+    cout << "Generation complete." << endl;
+}
+
+// --- 4. Завантаження операцій з файлу ---
+vector<Operation> load_operations(const string& filename) {
+    vector<Operation> ops;
+    ifstream file(filename);
+    string line, op_type;
+    int field_id, val;
+
+    while (getline(file, line)) {
+        stringstream ss(line);
+        ss >> op_type;
+        if (op_type == "read") {
+            ss >> field_id;
+            ops.push_back({ op_type, field_id, 0 });
+        }
+        else if (op_type == "write") {
+            ss >> field_id >> val;
+            ops.push_back({ op_type, field_id, val });
+        }
+        else if (op_type == "string") {
+            ops.push_back({ op_type, 0, 0 });
+        }
+    }
+    return ops;
+}
+
+// --- 5. Власний паралельний алгоритм ---
+// Виконує операції, K - к-сть потоків
+void run_parallel(DataStructure& ds, const vector<Operation>& ops, int K) {
+    size_t N = ops.size();
+    if (N == 0 || K < 1) return;
+
+    vector<future<void>> futures;
+    size_t chunk = N / K;
+    size_t remainder = N % K;
+
+    size_t current_start = 0;
+    for (int i = 0; i < K; ++i) {
+        size_t ops_count = chunk + (i < remainder ? 1 : 0);
+        size_t current_end = current_start + ops_count;
+
+        // Запускаємо асинхронну задачу
+        futures.push_back(async(launch::async, [&ds, &ops, current_start, current_end] {
+            // Тіло воркера
+            for (size_t j = current_start; j < current_end; ++j) {
+                const auto& op = ops[j];
+                if (op.type == "read") {
+                    (void)ds.read(op.field);
+                }
+                else if (op.type == "write") {
+                    ds.write(op.field, op.value);
+                }
+                else if (op.type == "string") {
+                    (void)static_cast<string>(ds);
+                }
+            }
+            }));
+        current_start = current_end;
+    }
+
+    // Чекаємо завершення всіх потоків
+    for (auto& f : futures) f.get();
+}
+
+// --- 6. Вимір часу ---
+double measure_time(function<void()> f) {
+    auto t1 = high_resolution_clock::now();
+    f();
+    auto t2 = high_resolution_clock::now();
+    return duration<double, milli>(t2 - t1).count();
+}
+
+// --- 7. Експеримент ---
+void run_experiment(const vector<Operation>& ops, const string& name, int m, double results_out[3]) {
+    cout << "--- Testing: " << name << " ---" << endl;
+    cout << "Total operations: " << ops.size() << "\n";
+
+    // Усереднення результатів (3 запуски)
+    int avg_count = 3;
+    double t_seq_avg = 0, t_par2_avg = 0, t_par3_avg = 0;
+
+    for (int i = 0; i < avg_count; ++i) {
+        // 1 потік
+        t_seq_avg += measure_time([&] {
+            DataStructure ds(m); // Скидаємо стан
+            run_parallel(ds, ops, 1);
+            });
+
+        // 2 потоки
+        t_par2_avg += measure_time([&] {
+            DataStructure ds(m); // Скидаємо стан
+            run_parallel(ds, ops, 2);
+            });
+
+        // 3 потоки
+        t_par3_avg += measure_time([&] {
+            DataStructure ds(m); // Скидаємо стан
+            run_parallel(ds, ops, 3);
+            });
+    }
+
+    double t_seq = t_seq_avg / avg_count;
+    double t_par2 = t_par2_avg / avg_count;
+    double t_par3 = t_par3_avg / avg_count;
+
+    // Зберігаємо для фінальної таблиці
+    results_out[0] = t_seq;
+    results_out[1] = t_par2;
+    results_out[2] = t_par3;
+
+    cout << "Threads: 1, Avg. Time: " << fixed << setprecision(3) << t_seq << " ms\n";
+    cout << "Threads: 2, Avg. Time: " << t_par2 << " ms (Speedup: " << t_seq / t_par2 << "x)\n";
+    cout << "Threads: 3, Avg. Time: " << t_par3 << " ms (Speedup: " << t_seq / t_par3 << "x)\n";
+    cout << "-------------------------------------------\n\n";
+}
+
+// --- 8. main ---
+int main() {
+    ios::sync_with_stdio(false);
+
+    const int M = 2; // m=2 для варіанту 14
+    const long TOTAL_OPS = 3'000'000; // К-сть операцій у кожному файлі
+
+    // 1. Генерація файлів
+    generate_data_files(M, TOTAL_OPS);
+    cout << "-------------------------------------------\n";
+
+    // 2. Завантаження операцій (щоб не враховувати час читання файлів)
+    cout << "Loading operation files into memory...\n";
+    vector<Operation> ops_a = load_operations("ops_a.txt");
+    vector<Operation> ops_b = load_operations("ops_b.txt");
+    vector<Operation> ops_c = load_operations("ops_c.txt");
+    cout << "Load complete. Starting benchmarks...\n";
+    cout << "-------------------------------------------\n";
+
+    // 3. Проведення тестів
+    vector<string> file_names = { "File A (Variant 14)", "File B (Equal)", "File C (Write-Heavy)" };
+
+    // Зберігаємо результати для таблиці
+    double results[3][3];
+
+    run_experiment(ops_a, file_names[0], M, results[0]);
+    run_experiment(ops_b, file_names[1], M, results[1]);
+    run_experiment(ops_c, file_names[2], M, results[2]);
+
+    // 4. Вивід фінальної таблиці для звіту
+    cout << "--- Final Results Table (for Report) --- \n";
+    cout << setw(20) << left << "| "
+        << setw(15) << right << "| 1 Thread (ms)"
+        << setw(15) << right << "| 2 Threads (ms)"
+        << setw(15) << right << "| 3 Threads (ms)" << "|\n";
+    cout << "|--------------------|---------------|---------------|---------------|\n";
+
+    for (int i = 0; i < 3; ++i) {
+        cout << "| " << setw(18) << left << file_names[i] << " | "
+            << setw(13) << right << fixed << setprecision(3) << results[i][0] << " | "
+            << setw(13) << right << results[i][1] << " | "
+            << setw(13) << right << results[i][2] << " |\n";
+    }
+
+    return 0;
+}
